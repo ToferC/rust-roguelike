@@ -1,20 +1,25 @@
 use tcod::colors::*;
 use tcod::console::*;
 
+use serde::{Serialize, Deserialize};
+
 pub const PLAYER: usize = 0;
 
-#[derive(Debug)]
-pub struct Object {
-    pub x: i32,
-    pub y: i32,
-    pub glyph: char,
-    pub color: Color,
-    pub name: String,
-    pub blocks: bool,
-    pub alive: bool,
-    pub fighter: Option<Fighter>,
-    pub ai: Option<AI>,
-    pub item: Option<Item>,
+#[derive(Debug, Serialize, Deserialize)]
+struct Object {
+    x: i32,
+    y: i32,
+    glyph: char,
+    color: Color,
+    name: String,
+    blocks: bool,
+    alive: bool,
+    fighter: Option<Fighter>,
+    ai: Option<AI>,
+    item: Option<Item>,
+    always_visible: bool,
+    level: i32,
+    equipment: Option<Equipment>,
 }
 
 impl Object {
@@ -30,6 +35,9 @@ impl Object {
             fighter: None,
             ai: None,
             item: None,
+            always_visible: false,
+            level: 1,
+            equipment: None,
         }
     }
 
@@ -54,8 +62,13 @@ impl Object {
         ((dx.pow(2) + dy.pow(2)) as f32).sqrt()
     }
 
+    /// return distance to a position
+    pub fn distance(&self, x: i32, y: i32) -> f32 {
+        (((x - self.x).pow(2) + (y - self.y).pow(2)) as f32).sqrt()
+    }
+
     // Combat
-    pub fn take_damage(&mut self, damage: i32, game: &mut Game) {
+    pub fn take_damage(&mut self, damage: i32, game: &mut Game) -> Option<i32> {
         // apply damage if possible
         if let Some(fighter) = self.fighter.as_mut() {
             if damage > 0 {
@@ -63,28 +76,32 @@ impl Object {
             }
         }
 
-        // chedk for death, call the death function
+        // check for death, call the death function
         if let Some(fighter) = self.fighter {
             if fighter.hp <= 0 {
                 self.alive = false;
                 fighter.on_death.callback(self, game);
+                return Some(fighter.xp);
             }
         }
+        None
     }
 
-    pub fn heal(&mut self, amount: i32) {
+    pub fn heal(&mut self, amount: i32, game: &Game) {
         // heal damage if possible
-        if let Some(fighter) = self.fighter.as_mut() {
+        let max_hp = self.max_hp(game);
+
+        if let Some(ref mut fighter) = self.fighter {
             fighter.hp += amount;
-            if fighter.hp > fighter.max_hp {
-                fighter.hp = fighter.max_hp;
+            if fighter.hp > max_hp {
+                fighter.hp = max_hp;
             }
         }
     }
 
     pub fn attack(&mut self, target: &mut Object, game: &mut Game) {
         // a simple formula for attack damage
-        let damage = self.fighter.map_or(0, |f| f.power) - target.fighter.map_or(0, |f| f.defense);
+        let damage = self.power(game) - target.defense(game);
         if damage > 0 {
             // make the target take damage
             game.messages.add(
@@ -92,7 +109,10 @@ impl Object {
                 "{} attacks {} for {} hit points.",
                 self.name, target.name, damage
             ), ORANGE);
-            target.take_damage(damage, game);
+            if let Some(xp) = target.take_damage(damage, game) {
+                // yield experience to player if target killed
+                self.fighter.as_mut().unwrap().xp += xp;
+            };
         } else {
             game.messages.add(format!(
                 "{} attacks {}, but it has no affect!",
@@ -100,117 +120,97 @@ impl Object {
             ), GREEN);
         }
     }
-}
 
-// basic AI functionality
-#[derive(Clone, Debug, PartialEq)]
-pub enum AI {
-    Basic,
-}
-
-pub fn ai_take_turn(monster_id: usize, tcod: &Tcod, game: &mut Game, objects: &mut [Object]) {
-    // a basic monster takes its turn. If you can see it, it can see you
-    let (monster_x, monstery_y) = objects[monster_id].pos();
-    if tcod.fov.is_in_fov(monster_x, monstery_y) {
-        if objects[monster_id].distance_to(&objects[PLAYER]) >= 2.0 {
-            // move towards player if far away
-            let (player_x, player_y) = objects[PLAYER].pos();
-            move_towards(monster_id, player_x, player_y, &game.map, objects);
-        } else {
-            // close enough, attack! (if the player is still alive)
-            let (monster, player) = mut_two(monster_id, PLAYER, objects);
-            monster.attack(player, game);
-        }
-    }
-}
-
-pub fn move_by(id: usize, dx: i32, dy: i32, map: &Map, objects: &mut [Object]) {
-    let (x, y) = objects[id].pos();
-    if !is_blocked(x + dx, y + dy, map, objects) {
-        objects[id].set_pos(x + dx, y + dy);
-    }
-}
-
-pub fn player_move_or_attack(dx: i32, dy: i32, game: &mut Game, objects: &mut [Object]) {
-    // the coordinates the player is moving to/attacking
-    let x = objects[PLAYER].x + dx;
-    let y = objects[PLAYER].y + dy;
-
-    // try to find an attackable object there
-    let target_id = objects
-        .iter()
-        .position(|object| object.fighter.is_some() && object.pos() == (x, y));
-
-    // attack if target found, move otherwise
-    match target_id {
-        Some(target_id) => {
-            let (player, target) = mut_two(PLAYER, target_id, objects);
-            player.attack(target, game);
-        }
-        None => {
-            move_by(PLAYER, dx, dy, &game.map, objects);
-        }
-    }
-}
-
-pub fn move_towards(id: usize, target_x: i32, target_y: i32, map: &Map, objects: &mut [Object]) {
-    // vector from this object to the target and distance
-    let dx = target_x - objects[id].x;
-    let dy = target_y - objects[id].y;
-    let distance = ((dx.pow(2) + dy.pow(2)) as f32).sqrt();
-
-    // normalize to length 1 (preserving direction), then round it and
-    // convert to integer so the movement is restricted to map grig
-    let dx = (dx as f32 / distance).round() as i32;
-    let dy = (dy as f32 / distance).round() as i32;
-    move_by(id, dx, dy, map, objects);
-}
-
-// combat related properties
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct Fighter {
-    pub max_hp: i32,
-    pub hp: i32,
-    pub defense: i32,
-    pub power: i32,
-    pub on_death: DeathCallback,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum DeathCallback {
-    Player,
-    Monster,
-}
-
-impl DeathCallback {
-    fn callback(self, object: &mut Object, game: &mut Game) {
-        use DeathCallback::*;
-        let callback = match self {
-            Player => player_death,
-            Monster => monster_death,
+    /// Equip object and show a message about it
+    pub fn equip(&mut self, messages: &mut Messages) {
+        if self.item.is_none() {
+            messages.add(
+                format!("Can't equip {:?} because it's not an Item.", self),
+                RED,
+            );
+            return;
         };
-        callback(object, game);
+        if let Some(ref mut equipment) = self.equipment {
+            if !equipment.equipped {
+                equipment.equipped = true;
+                messages.add(
+                    format!("Equipped {} on {:?}.", self.name, equipment.slot),
+                    LIGHT_GREEN,
+                );
+            }
+        } else {
+            messages.add(
+                format!("Can't equp {:?} because it;s not an Equipment.", self),
+                RED,
+            );
+        }
     }
-}
 
-pub fn player_death(player: &mut Object, game: &mut Game) {
-    // the game ended
-    game.messages.add("You died!", RED);
-    // for addd effect, transform the player into a corpse!
-    player.glyph = '%';
-    player.color = DARK_RED;
-}
+    /// Dequip object and show a message about it
+    pub fn dequip(&mut self, messages: &mut Messages) {
+        if self.item.is_none() {
+            messages.add(
+                format!("Can't dequip {:?} because it's not an item.", self),
+                RED,
+            );
+            return;
+        };
+        if let Some(ref mut equipment) = self.equipment {
+            if equipment.equipped {
+                equipment.equipped = false;
+                messages.add(
+                    format!("Dequipped {} from {:?}.", self.name, equipment.slot),
+                    LIGHT_YELLOW,
+                );
+            }
+        } else {
+            messages.add(
+                format!("Can't dequip {:?} because it's not an Equipment.", self),
+                RED,
+            );
+        }
+    }
 
-pub fn monster_death(monster: &mut Object, game: &mut Game) {
-    // transform it into a nasty corpse. It doesn't block, can't be attacked
-    // and doesn't move
-    game.messages.add(
-        format!("{} is dead!", monster.name),
-        RED);
-    monster.glyph = '%';
-    monster.color = DARK_RED;
-    monster.blocks = false;
-    monster.fighter = None;
-    monster.ai = None;
-    monster.name = format!("remains of {}", monster.name);
+    pub fn power(&self, game: &Game) -> i32 {
+        let base_power = self.fighter.map_or(0, |f| f.base_power);
+        let bonus: i32 = self
+            .get_all_equipped(game)
+            .iter()
+            .map(|e| e.power_bonus)
+            .sum();
+        base_power + bonus
+    }
+
+    pub fn defense(&self, game: &Game) -> i32 {
+        let base_defense = self.fighter.map_or(0, |f| f.base_defense);
+        let bonus: i32 = self
+            .get_all_equipped(game)
+            .iter()
+            .map(|e| e.defense_bonus)
+            .sum();
+        base_defense + bonus
+    }
+
+    pub fn max_hp(&self, game: &Game) -> i32 {
+        let base_max_hp = self.fighter.map_or(0, |f| f.base_max_hp);
+        let bonus: i32 = self
+            .get_all_equipped(game)
+            .iter()
+            .map(|e| e.max_hp_bonus)
+            .sum();
+        base_max_hp + bonus
+    }
+
+    pub fn get_all_equipped(&self, game: &Game) -> Vec<Equipment> {
+        if self.name == "player" {
+            game.inventory
+                .iter()
+                .filter(|item| item.equipment.map_or(false, |e| e.equipped))
+                .map(|item| item.equipment.unwrap())
+                .collect()
+        } else {
+            vec![] // other items have no equipment
+        }
+    }
+
 }
